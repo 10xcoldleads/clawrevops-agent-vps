@@ -29,9 +29,10 @@ from pathlib import Path
 STATE_FILE = "/var/lib/clawrevops/setup_state.json"
 LOG_FILE = "/var/log/clawrevops_setup.log"
 
-# Update when Hermes publishes/confirms an official install one-liner.
-# Runs as the agent user. Leave empty to show a "coming soon" notice instead.
-HERMES_INSTALL_CMD = ""
+# Official Hermes Agent installer (Nous Research docs:
+# hermes-agent.nousresearch.com/docs/getting-started/installation).
+# Includes Hermes' own headless Chromium (Playwright) for browser automation.
+HERMES_INSTALL_CMD = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
 OPENCLAW_INSTALL_CMD = "curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard"
 CLAUDE_CODE_INSTALL_CMD = "curl -fsSL https://claude.ai/install.sh | bash"
@@ -66,6 +67,9 @@ class AgentVPSSetup:
         self.ssh_keys_copied = state.get("ssh_keys_copied", False)
         self.assistant_choice = state.get("assistant_choice")  # codex|claude|both|skip
         self.platform_choice = state.get("platform_choice")    # hermes|openclaw|both|skip
+        self.server_mode = state.get("server_mode")            # full|headless
+        self.hermes_deploy = state.get("hermes_deploy")        # docker|native
+        self.openclaw_deploy = state.get("openclaw_deploy")    # docker|native
 
     # ── State management ──────────────────────────────────────────────────────
 
@@ -157,11 +161,14 @@ class AgentVPSSetup:
 
     def run_as_user(self, command, check=True, capture_output=True):
         """Run a command as the agent user in a fresh login shell.
-        A login shell (`su - user`) picks up the user's PATH, npm prefix,
-        and fresh group membership (e.g. docker)."""
+        IMPORTANT: Ubuntu's default .bashrc exits early for non-interactive
+        shells, so PATH lines appended to it are NOT seen by `su - user -c`.
+        We therefore export the user tool paths explicitly on every call."""
         if not self.agent_username:
             raise RuntimeError("Agent user not created yet")
-        escaped = command.replace("'", "'\"'\"'")
+        path_prefix = ('export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:'
+                       '$HOME/.hermes/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"; ')
+        escaped = (path_prefix + command).replace("'", "'\"'\"'")
         return self.run_command(
             f"su - {self.agent_username} -c '{escaped}'",
             check=check, capture_output=capture_output
@@ -230,17 +237,204 @@ This setup turns a fresh VPS into an AI agent server.
 
 It installs:
   1) A safe non-root user
-  2) Tailscale private networking
-  3) MANDATORY Tailscale lockdown (SSH becomes private-only)
-  4) Docker
-  5) Claude Code or OpenAI Codex CLI
-  6) Hermes Agent or OpenClaw
-  7) Agent folders and workspace
-  8) Optional SSH key hardening
+  2) Desktop + Remote Desktop (RDP) — full mode
+  3) Tailscale private networking
+  4) MANDATORY Tailscale lockdown (SSH/RDP become private-only)
+  5) Docker
+  6) Claude Code or OpenAI Codex CLI
+  7) Hermes Agent or OpenClaw (+ Homebrew, Chrome)
+  8) Agent folders and workspace
+  9) Optional SSH key hardening
 
 Security is not optional here. Your agent server locks down to
 Tailscale-only access BEFORE any agent software installs.
 """)
+
+    # ── Step: server mode + desktop / RDP (ported from ClawGlue) ─────────────
+
+    def choose_server_mode(self):
+        if self.server_mode:
+            return
+        print(f"\n{Colors.HEADER}=== SERVER MODE ==={Colors.ENDC}")
+
+        # OpenClaw's Chrome extension and browser tooling want a real desktop.
+        # Hermes ships its OWN headless Chromium and is driven from Telegram /
+        # terminal — no desktop needed.
+        needs_desktop = self.platform_choice in ("openclaw", "both")
+
+        if needs_desktop:
+            print(f"""{Colors.CYAN}
+  You picked OpenClaw, which works best WITH a desktop: connect by
+  Remote Desktop from your computer, use Chrome ON the server, and
+  click through every tool login like a normal computer.
+
+  {Colors.WARNING}Full mode wants 4GB+ RAM (8GB comfortable).{Colors.ENDC}{Colors.CYAN}
+{Colors.ENDC}""")
+            default = 0
+        else:
+            print(f"""{Colors.CYAN}
+  You picked Hermes, which does NOT need a desktop — it installs
+  its own built-in browser for automation, and you talk to it from
+  Telegram or the terminal. Headless keeps your server light.
+
+  (Full mode is still available if you want a visual desktop.)
+{Colors.ENDC}""")
+            default = 1
+
+        choice = self.get_user_input(
+            "Which server mode?",
+            ["Full — desktop + Remote Desktop (RDP)"
+             + (" - recommended for OpenClaw" if needs_desktop else ""),
+             "Headless — SSH terminal only"
+             + ("" if needs_desktop else " - recommended for Hermes")],
+            default_index=default
+        )
+        self.server_mode = "full" if choice == 0 else "headless"
+        self._save_state(server_mode=self.server_mode)
+
+    def install_desktop(self):
+        """Install XFCE + LightDM + xrdp (ported from ClawGlue)."""
+        if self.server_mode != "full":
+            return
+        if self._step_done("desktop_setup"):
+            self.log("Desktop setup already completed — skipping", "SUCCESS")
+            return
+
+        print(f"\n{Colors.HEADER}=== DESKTOP ENVIRONMENT ==={Colors.ENDC}")
+
+        result = self.run_command("dpkg -l xfce4-session 2>/dev/null | grep '^ii'", check=False)
+        if result.returncode == 0:
+            self.log("XFCE already installed", "SUCCESS")
+            result = self.run_command("dpkg -l xrdp 2>/dev/null | grep '^ii'", check=False)
+            if result.returncode != 0:
+                self.log("Installing xrdp...")
+                self.run_command("apt install -y xrdp", capture_output=False)
+                self.service_command("enable", "xrdp")
+        else:
+            self.log("Installing XFCE + LightDM + xrdp (this takes a few minutes)...", "WARNING")
+            self.run_command("DEBIAN_FRONTEND=noninteractive apt install -y "
+                             "xfce4 xfce4-goodies lightdm xrdp", capture_output=False)
+            Path("/etc/lightdm").mkdir(parents=True, exist_ok=True)
+            with open("/etc/lightdm/lightdm.conf", "w") as f:
+                f.write("[Seat:*]\nWaylandEnable=false\nuser-session=xfce\n")
+            self.service_command("enable", "lightdm")
+            self.service_command("enable", "xrdp")
+            self.log("XFCE desktop environment installed", "SUCCESS")
+
+        self._save_state(desktop_setup=True, desktop_type="xfce")
+
+    def setup_user_session(self):
+        """Give the agent user an XFCE session for RDP logins."""
+        if self.server_mode != "full" or self._step_done("user_session_setup"):
+            return
+        xsession_path = f"/home/{self.agent_username}/.xsession"
+        with open(xsession_path, "w") as f:
+            f.write("#!/bin/bash\nexec xfce4-session\n")
+        self.run_command(f"chown {self.agent_username}:{self.agent_username} {xsession_path}")
+        self.run_command(f"chmod 755 {xsession_path}")
+        self._save_state(user_session_setup=True)
+
+    def configure_rdp_persistence(self):
+        """xrdp session persistence + XFCE no-sleep/no-lock (ported from ClawGlue)."""
+        if self.server_mode != "full":
+            return
+        if self._step_done("rdp_configured"):
+            self.log("RDP persistence already configured — skipping", "SUCCESS")
+            return
+
+        print(f"\n{Colors.HEADER}=== RDP SESSION PERSISTENCE ==={Colors.ENDC}")
+        needs_xrdp_restart = False
+
+        xrdp_ini_path = "/etc/xrdp/xrdp.ini"
+        try:
+            with open(xrdp_ini_path, "r") as f:
+                xrdp_config = f.read()
+            if "[Xorg]" in xrdp_config and "libxup.so" in xrdp_config:
+                self.log("xrdp Xorg persistence module already configured", "SUCCESS")
+            else:
+                self.run_command(f"cp {xrdp_ini_path} {xrdp_ini_path}.backup")
+                xorg_block = """
+[Xorg]
+name=Xorg
+lib=libxup.so
+username=ask
+password=ask
+ip=127.0.0.1
+port=-1
+code=20
+"""
+                with open(xrdp_ini_path, "a") as f:
+                    f.write(xorg_block)
+                needs_xrdp_restart = True
+                self.log("xrdp Xorg persistence module added", "SUCCESS")
+        except FileNotFoundError:
+            self.log("xrdp.ini not found - xrdp may not have installed correctly", "ERROR")
+
+        # XFCE: disable sleep, DPMS, and screen lock (idempotent system defaults)
+        xfconf_dir = Path("/etc/xdg/xfce4/xfconf/xfce-perchannel-xml")
+        xfconf_dir.mkdir(parents=True, exist_ok=True)
+        power_xml = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-power-manager" version="1.0">
+  <property name="xfce4-power-manager" type="empty">
+    <property name="inactivity-sleep-mode-on-ac" type="uint" value="0"/>
+    <property name="blank-on-ac" type="int" value="0"/>
+    <property name="dpms-on-ac-sleep" type="uint" value="0"/>
+    <property name="dpms-on-ac-off" type="uint" value="0"/>
+  </property>
+</channel>"""
+        screensaver_xml = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-screensaver" version="1.0">
+  <property name="saver" type="empty">
+    <property name="enabled" type="bool" value="false"/>
+    <property name="lock-enabled" type="bool" value="false"/>
+  </property>
+</channel>"""
+        (xfconf_dir / "xfce4-power-manager.xml").write_text(power_xml)
+        (xfconf_dir / "xfce4-screensaver.xml").write_text(screensaver_xml)
+        self.log("XFCE persistence configured: no sleep, no screen lock", "SUCCESS")
+
+        self.service_command("enable", "xrdp")
+        if needs_xrdp_restart:
+            self.service_command("restart", "xrdp")
+        self._save_state(rdp_configured=True)
+
+    def install_chrome(self):
+        """Install Google Chrome for in-desktop browser logins (ported from ClawGlue)."""
+        if self.server_mode != "full":
+            return
+        if self._step_done("chrome_installed"):
+            self.log("Chrome already installed — skipping", "SUCCESS")
+            return
+        print(f"\n{Colors.HEADER}=== GOOGLE CHROME ==={Colors.ENDC}")
+        result = self.run_command("dpkg -l | grep google-chrome", check=False)
+        if result.returncode == 0:
+            self.log("Google Chrome is already installed", "SUCCESS")
+            self._save_state(chrome_installed=True)
+            return
+        try:
+            self.log("Downloading Chrome package...")
+            self.run_command("wget -q -O /tmp/google-chrome-stable_current_amd64.deb "
+                             "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb")
+            self.run_command("apt install -y /tmp/google-chrome-stable_current_amd64.deb",
+                             capture_output=False)
+            self.run_command("rm -f /tmp/google-chrome-stable_current_amd64.deb")
+        except subprocess.CalledProcessError:
+            self.log("Fallback: Installing Chrome via repository...", "WARNING")
+            self.run_command("wget -q -O /usr/share/keyrings/google-chrome.gpg "
+                             "https://dl.google.com/linux/linux_signing_key.pub")
+            self.run_command('echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg]'
+                             ' http://dl.google.com/linux/chrome/deb/ stable main"'
+                             ' > /etc/apt/sources.list.d/google-chrome.list')
+            self.run_command("apt update")
+            self.run_command("apt install -y google-chrome-stable", capture_output=False)
+        result = self.run_command("google-chrome --version", check=False)
+        if result.returncode == 0:
+            self.log(f"Chrome installed: {result.stdout.strip()}", "SUCCESS")
+            self._save_state(chrome_installed=True)
+        else:
+            self.log("Chrome install could not be verified — re-run setup to retry", "WARNING")
 
     # ── Step: system update ───────────────────────────────────────────────────
 
@@ -293,49 +487,47 @@ Tailscale-only access BEFORE any agent software installs.
             self.log(f"Swap setup skipped: {e}", "WARNING")
         self._save_state(swap_checked=True)
 
-    # ── Step: create non-root agent user ──────────────────────────────────────
+    # ── Step: create the user's login (non-root) ──────────────────────────────
 
     def create_agent_user(self):
         if self._step_done("agent_user_created") and self.agent_username:
-            self.log(f"Agent user '{self.agent_username}' already created — skipping", "SUCCESS")
+            self.log(f"Your login '{self.agent_username}' already created — skipping", "SUCCESS")
             return
 
-        print(f"\n{Colors.HEADER}=== AGENT USER CREATION ==={Colors.ENDC}")
+        print(f"\n{Colors.HEADER}=== CREATE YOUR LOGIN ==={Colors.ENDC}")
         print(f"""{Colors.CYAN}
-  Your agents and coding assistants should never run as root.
-  This step creates a dedicated non-root user that everything
-  installs under. Root stays for system administration only.
+  You must now create YOUR login for this server — a brand new
+  username and password. This is what you will use to connect
+  from your computer (SSH terminal and Remote Desktop), and it's
+  where all your AI tools install.
+
+  Never run your agents as root. Root stays for system
+  administration only.
+
+  Pick something personal and easy to remember, like your first
+  name (lowercase). Example: ty
 {Colors.ENDC}""")
 
         while True:
-            username = input(f"{Colors.CYAN}Enter username for your agent user [agent]: {Colors.ENDC}").strip()
+            username = input(f"{Colors.CYAN}Choose your new username: {Colors.ENDC}").strip()
             if not username:
-                username = "agent"
+                print(f"{Colors.WARNING}You must choose a username to continue.{Colors.ENDC}")
+                continue
 
             if not re.match(r'^[a-z_][a-z0-9_-]*$', username):
                 print(f"{Colors.WARNING}Username must start with a lowercase letter and may only "
                       f"contain lowercase letters, digits, underscores, and hyphens.{Colors.ENDC}")
                 continue
 
+            if username in ("root", "admin"):
+                print(f"{Colors.WARNING}'{username}' is reserved — choose a personal username.{Colors.ENDC}")
+                continue
+
             result = self.run_command(f"id {username}", check=False)
             if result.returncode == 0:
-                self.log(f"User '{username}' already exists", "WARNING")
-                choice = self.get_user_input(
-                    f"User '{username}' already exists. What would you like to do?",
-                    ["Use existing user", "Pick a different name", "Exit setup"],
-                    default_index=0
-                )
-                if choice == 0:
-                    self.agent_username = username
-                    self.run_command(f"usermod -aG sudo {username}", check=False)
-                    self.log(f"Using existing user: {username} (ensured sudo membership)", "SUCCESS")
-                    self._save_state(agent_user_created=True, agent_username=username)
-                    self.copy_ssh_keys()
-                    return
-                elif choice == 1:
-                    continue
-                else:
-                    sys.exit(0)
+                print(f"{Colors.WARNING}'{username}' already exists on this server. "
+                      f"You must create a NEW username — pick a different one.{Colors.ENDC}")
+                continue
             break
 
         # Generate secure 16-char password (exclude ambiguous chars: 0, O, I, l, 1)
@@ -356,7 +548,7 @@ Tailscale-only access BEFORE any agent software installs.
 
             lines = [
                 f"╔{sep}╗",
-                bl("AGENT USER CREDENTIALS"),
+                bl("YOUR LOGIN — SAVE THIS"),
                 bl(""),
                 bl(f"  USERNAME: {uname}"),
                 bl(f"  PASSWORD: {pwd}"),
@@ -418,13 +610,13 @@ Tailscale-only access BEFORE any agent software installs.
         print()
 
         self.agent_username = username
-        self.log(f"Agent user '{username}' created with sudo access", "SUCCESS")
+        self.log(f"Your login '{username}' is created (with sudo access)", "SUCCESS")
         self._save_state(agent_user_created=True, agent_username=username)
 
         self.copy_ssh_keys()
 
     def copy_ssh_keys(self):
-        """Copy root's authorized_keys to the agent user so SSH key login works.
+        """Copy root's authorized_keys to the new user so SSH key login works.
         This MUST succeed before hardening is allowed (lockout prevention)."""
         if self._step_done("ssh_keys_copied"):
             self.ssh_keys_copied = True
@@ -512,10 +704,10 @@ Tailscale-only access BEFORE any agent software installs.
               f"on this machine. That's expected for an agent server you control.{Colors.ENDC}")
 
         # Verify in a fresh login shell so the new group membership applies
-        self.log("Verifying Docker works for the agent user...")
+        self.log(f"Verifying Docker works for '{self.agent_username}'...")
         verify = self.run_as_user("docker run --rm hello-world", check=False)
         if verify.returncode == 0:
-            self.log("Docker verified (hello-world ran as agent user)", "SUCCESS")
+            self.log(f"Docker verified (hello-world ran as '{self.agent_username}')", "SUCCESS")
         else:
             self.log("Docker hello-world failed — check 'systemctl status docker' "
                      "and re-run setup", "WARNING")
@@ -541,6 +733,35 @@ Tailscale-only access BEFORE any agent software installs.
         self.service_command("enable --now", "tailscaled")
         self.log("Tailscale installed and tailscaled enabled", "SUCCESS")
         self._save_state(tailscale_installed=True)
+
+    def show_connection_info(self, heading="YOUR PRIVATE CONNECTION INFO — SAVE THIS"):
+        """Print the user's Tailscale SSH (and RDP) details. Shown after
+        Tailscale connects, on phase-2 resume, and in the final report."""
+        if not self.tailscale_ip:
+            return
+        user = self.agent_username or "YOUR_USERNAME"
+        print(f"""
+{Colors.GREEN}{Colors.BOLD}╔══════════════════════════════════════════════════════════════╗
+║   {heading:<59}║
+╚══════════════════════════════════════════════════════════════╝{Colors.ENDC}
+
+{Colors.BOLD}  Tailscale IP:{Colors.ENDC}  {Colors.GREEN}{Colors.BOLD}{self.tailscale_ip}{Colors.ENDC}
+
+{Colors.BOLD}  SSH from YOUR computer{Colors.ENDC} (Terminal on Mac, PowerShell on Windows):
+
+      {Colors.BOLD}ssh {user}@{self.tailscale_ip}{Colors.ENDC}
+
+  Password: the one you saved when you created '{user}'.""")
+        if self.server_mode == "full":
+            print(f"""
+{Colors.BOLD}  Remote Desktop from YOUR computer:{Colors.ENDC}
+      Windows:  Win+R → {Colors.BOLD}mstsc{Colors.ENDC} → connect to {Colors.BOLD}{self.tailscale_ip}{Colors.ENDC}
+      Mac:      'Windows App' (free, App Store) → add PC {Colors.BOLD}{self.tailscale_ip}{Colors.ENDC}
+      Login:    {Colors.BOLD}{user}{Colors.ENDC} + your saved password""")
+        print(f"""
+{Colors.DIM}  Requires Tailscale running on your computer, signed in to the
+  SAME account: https://tailscale.com/download{Colors.ENDC}
+""")
 
     def configure_tailscale(self):
         # Already authenticated? (works even without state file)
@@ -613,6 +834,7 @@ Tailscale-only access BEFORE any agent software installs.
             self.tailscale_ip = result.stdout.strip().splitlines()[0]
             self.log(f"Tailscale IP assigned: {self.tailscale_ip}", "SUCCESS")
             self._save_state(tailscale_configured=True, tailscale_ip=self.tailscale_ip)
+            self.show_connection_info()
             return True
         except Exception:
             self.log("Failed to get Tailscale IP", "ERROR")
@@ -646,13 +868,17 @@ Tailscale-only access BEFORE any agent software installs.
             self.run_command("DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs")
         # Per-user global prefix
         self.run_as_user("mkdir -p ~/.npm-global && npm config set prefix ~/.npm-global")
-        bashrc = Path(f"/home/{self.agent_username}/.bashrc")
+        # Write PATH to BOTH .profile (login shells) and .bashrc (interactive).
+        # .bashrc alone is not enough: Ubuntu's default .bashrc exits early
+        # for non-interactive shells before reaching appended lines.
         path_line = 'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"'
-        content = bashrc.read_text() if bashrc.exists() else ""
-        if path_line not in content:
-            with open(bashrc, "a") as f:
-                f.write(f"\n# Added by ClawRevOps Agent VPS setup\n{path_line}\n")
-            self.run_command(f"chown {self.agent_username}:{self.agent_username} {bashrc}")
+        for rc in (".profile", ".bashrc"):
+            rc_path = Path(f"/home/{self.agent_username}/{rc}")
+            content = rc_path.read_text() if rc_path.exists() else ""
+            if path_line not in content:
+                with open(rc_path, "a") as f:
+                    f.write(f"\n# Added by ClawRevOps Agent VPS setup\n{path_line}\n")
+                self.run_command(f"chown {self.agent_username}:{self.agent_username} {rc_path}")
         self._save_state(node_ready=True)
 
     def install_codex_cli(self):
@@ -666,7 +892,7 @@ Tailscale-only access BEFORE any agent software installs.
   provider configuration — you'll sign in after setup completes.
 {Colors.ENDC}""")
         self._ensure_node_for_user()
-        self.log("Installing Codex CLI under the agent user...")
+        self.log(f"Installing Codex CLI under '{self.agent_username}'...")
         self.run_as_user(f"npm install -g {CODEX_NPM_PACKAGE}")
         verify = self.run_as_user("command -v codex", check=False)
         if verify.returncode == 0:
@@ -682,10 +908,10 @@ Tailscale-only access BEFORE any agent software installs.
         print(f"\n{Colors.HEADER}=== CLAUDE CODE ==={Colors.ENDC}")
         print(f"""{Colors.CYAN}
   Claude Code is an excellent coding assistant. It installs under
-  your non-root agent user (never run it as root). Login is handled
+  your own user '{self.agent_username}' (never run it as root). Login is handled
   separately after setup completes.
 {Colors.ENDC}""")
-        self.log("Installing Claude Code under the agent user...")
+        self.log(f"Installing Claude Code under '{self.agent_username}'...")
         self.run_as_user(CLAUDE_CODE_INSTALL_CMD, capture_output=False)
         verify = self.run_as_user("command -v claude", check=False)
         if verify.returncode == 0:
@@ -719,6 +945,46 @@ Tailscale-only access BEFORE any agent software installs.
         self.platform_choice = ["hermes", "openclaw", "both", "skip"][choice]
         self._save_state(platform_choice=self.platform_choice)
 
+    def install_homebrew(self):
+        """Pre-install Homebrew so OpenClaw skills install correctly during
+        onboarding (ported from ClawGlue post_lockdown_setup)."""
+        if self._step_done("homebrew_installed"):
+            self.log("Homebrew already installed — skipping", "SUCCESS")
+            return
+        result = self.run_as_user("command -v brew", check=False)
+        if result.returncode == 0:
+            self.log("Homebrew already present", "SUCCESS")
+            self._save_state(homebrew_installed=True)
+            return
+        print(f"\n{Colors.HEADER}=== HOMEBREW (for OpenClaw skills) ==={Colors.ENDC}")
+        self.log("Installing build tools and Homebrew (this can take a few minutes)...")
+        self.run_command(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+            "build-essential procps file git"
+        )
+        self.run_command(
+            "curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh "
+            "-o /tmp/brew_install.sh"
+        )
+        self.run_as_user("NONINTERACTIVE=1 bash /tmp/brew_install.sh", check=False,
+                         capture_output=False)
+        # Make brew available in the user's shells
+        brew_line = 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"'
+        for rc in (".profile", ".bashrc"):
+            rc_path = Path(f"/home/{self.agent_username}/{rc}")
+            content = rc_path.read_text() if rc_path.exists() else ""
+            if brew_line not in content and Path("/home/linuxbrew/.linuxbrew/bin/brew").exists():
+                with open(rc_path, "a") as f:
+                    f.write(f"\n{brew_line}\n")
+                self.run_command(f"chown {self.agent_username}:{self.agent_username} {rc_path}")
+        verify = self.run_as_user("command -v brew", check=False)
+        if verify.returncode == 0:
+            self.log("Homebrew installed", "SUCCESS")
+            self._save_state(homebrew_installed=True)
+        else:
+            self.log("Homebrew install could not be verified — OpenClaw onboarding "
+                     "may still work; some skills might need brew later", "WARNING")
+
     def install_openclaw(self):
         if self._step_done("openclaw_installed"):
             self.log("OpenClaw already installed — skipping", "SUCCESS")
@@ -729,7 +995,8 @@ Tailscale-only access BEFORE any agent software installs.
   Docker and Tailscale. After installation, you'll run its
   onboarding ('openclaw onboard') to connect your provider.
 {Colors.ENDC}""")
-        self.log("Installing OpenClaw under the agent user (onboarding deferred)...")
+        self.install_homebrew()
+        self.log(f"Installing OpenClaw under '{self.agent_username}' (onboarding deferred)...")
         self.run_as_user(OPENCLAW_INSTALL_CMD, capture_output=False)
         verify = self.run_as_user("command -v openclaw", check=False)
         if verify.returncode == 0:
@@ -744,24 +1011,158 @@ Tailscale-only access BEFORE any agent software installs.
             return
         print(f"\n{Colors.HEADER}=== HERMES AGENT ==={Colors.ENDC}")
         print(f"""{Colors.CYAN}
-  Hermes is an agent platform with memory, skills, and workflows.
-  You'll configure your provider after installation.
+  Hermes is an open-source agent platform (Nous Research) with
+  memory, skills, and workflows. After setup completes you'll run
+  'hermes setup' to connect your provider and channels.
 {Colors.ENDC}""")
-        if not HERMES_INSTALL_CMD:
-            self.log("Hermes install command is not configured in this build yet — "
-                     "skipping for now. Watch the community for the update.", "WARNING")
-            return
-        self.log("Installing Hermes Agent under the agent user...")
+        self.log(f"Installing Hermes Agent under '{self.agent_username}' (setup deferred)...")
         self.run_as_user(HERMES_INSTALL_CMD, capture_output=False)
-        self._save_state(hermes_installed=True)
-        self.log("Hermes Agent installed", "SUCCESS")
+        verify = self.run_as_user("command -v hermes", check=False)
+        if verify.returncode == 0:
+            self.log("Hermes Agent installed", "SUCCESS")
+            self._save_state(hermes_installed=True)
+        else:
+            self.log("Hermes install could not be verified — re-run setup to retry", "WARNING")
+
+    def choose_deploy_methods(self):
+        """Per-platform: Docker container vs native install."""
+        if self.platform_choice in ("hermes", "both") and not self.hermes_deploy:
+            print(f"""{Colors.CYAN}
+  Hermes can run as a Docker container (official image, shows up
+  in your VPS Docker Manager, auto-restarts, one-click updates)
+  or installed natively on the server.
+{Colors.ENDC}""")
+            choice = self.get_user_input(
+                "How should Hermes run?",
+                ["Docker container - recommended",
+                 "Native install (directly on the server)"],
+                default_index=0
+            )
+            self.hermes_deploy = "docker" if choice == 0 else "native"
+            self._save_state(hermes_deploy=self.hermes_deploy)
+
+        if self.platform_choice in ("openclaw", "both") and not self.openclaw_deploy:
+            print(f"""{Colors.CYAN}
+  OpenClaw can install natively (full skill support + Homebrew +
+  desktop Chrome — the proven ClawGlue way) or as a Docker
+  container (isolated, visible in your VPS Docker Manager, BUT the
+  official OpenClaw image has no Homebrew, so brew-based skills
+  won't be available inside the container).
+{Colors.ENDC}""")
+            choice = self.get_user_input(
+                "How should OpenClaw run?",
+                ["Native install - recommended (full skills, ClawGlue-proven)",
+                 "Docker container (some skills unavailable)"],
+                default_index=0
+            )
+            self.openclaw_deploy = "native" if choice == 0 else "docker"
+            self._save_state(openclaw_deploy=self.openclaw_deploy)
+
+    def _docker_bind_ip(self):
+        """IP to bind published container ports to. CRITICAL: Docker's
+        published ports bypass UFW (iptables DOCKER chain), so publishing
+        on 0.0.0.0 would expose agent gateways to the public internet
+        despite the lockdown. Binding to the Tailscale IP keeps them
+        private-network-only."""
+        return self.tailscale_ip or "127.0.0.1"
+
+    def _write_compose(self, platform, content):
+        """Write a docker-compose.yml under the agent workspace and chown it."""
+        user = self.agent_username
+        stack_dir = Path(f"/home/{user}/clawrevops/agents/{platform}")
+        stack_dir.mkdir(parents=True, exist_ok=True)
+        (stack_dir / "data").mkdir(exist_ok=True)
+        (stack_dir / "docker-compose.yml").write_text(content)
+        self.run_command(f"chown -R {user}:{user} /home/{user}/clawrevops")
+        return stack_dir
+
+    def install_hermes_docker(self):
+        if self._step_done("hermes_installed"):
+            self.log("Hermes already installed — skipping", "SUCCESS")
+            return
+        print(f"\n{Colors.HEADER}=== HERMES AGENT (Docker) ==={Colors.ENDC}")
+        bind_ip = self._docker_bind_ip()
+        compose = f"""# ClawRevOps — Hermes Agent (official Nous Research image)
+# Manage:  docker logs -f clawrevops-hermes
+# Update:  docker compose pull && docker compose up -d
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: clawrevops-hermes
+    restart: unless-stopped
+    command: gateway run
+    ports:
+      # Bound to your Tailscale IP — NOT public. Docker bypasses UFW,
+      # so binding to {bind_ip} is what keeps this private.
+      - "{bind_ip}:8642:8642"
+    volumes:
+      - ./data:/opt/data
+"""
+        stack_dir = self._write_compose("hermes", compose)
+        self.log("Pulling Hermes image and starting container (this can take a few minutes)...")
+        self.run_as_user(f"cd {stack_dir} && docker compose pull && docker compose up -d",
+                         capture_output=False)
+        verify = self.run_command(
+            "docker ps --filter name=clawrevops-hermes --filter status=running -q",
+            check=False
+        )
+        if verify.returncode == 0 and verify.stdout.strip():
+            self.log("Hermes container running (visible in your VPS Docker Manager)", "SUCCESS")
+            self._save_state(hermes_installed=True)
+        else:
+            self.log("Hermes container did not start — check "
+                     f"'docker logs clawrevops-hermes' and re-run setup", "WARNING")
+
+    def install_openclaw_docker(self):
+        if self._step_done("openclaw_installed"):
+            self.log("OpenClaw already installed — skipping", "SUCCESS")
+            return
+        print(f"\n{Colors.HEADER}=== OPENCLAW (Docker) ==={Colors.ENDC}")
+        bind_ip = self._docker_bind_ip()
+        compose = f"""# ClawRevOps — OpenClaw gateway (official pre-built image)
+# Onboard: docker exec -it clawrevops-openclaw node dist/index.js onboard
+# Manage:  docker logs -f clawrevops-openclaw
+# Update:  docker compose pull && docker compose up -d
+services:
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: clawrevops-openclaw
+    restart: unless-stopped
+    ports:
+      # Bound to your Tailscale IP — NOT public. Docker bypasses UFW,
+      # so binding to {bind_ip} is what keeps this private.
+      - "{bind_ip}:18789:18789"
+    volumes:
+      - ./data:/home/node/.openclaw
+"""
+        stack_dir = self._write_compose("openclaw", compose)
+        self.log("Pulling OpenClaw image and starting container (this can take a few minutes)...")
+        self.run_as_user(f"cd {stack_dir} && docker compose pull && docker compose up -d",
+                         capture_output=False)
+        verify = self.run_command(
+            "docker ps --filter name=clawrevops-openclaw --filter status=running -q",
+            check=False
+        )
+        if verify.returncode == 0 and verify.stdout.strip():
+            self.log("OpenClaw container running (visible in your VPS Docker Manager)", "SUCCESS")
+            self._save_state(openclaw_installed=True)
+        else:
+            self.log("OpenClaw container did not start — check "
+                     f"'docker logs clawrevops-openclaw' and re-run setup", "WARNING")
 
     def install_agent_platforms(self):
         self.choose_agent_platform()
+        self.choose_deploy_methods()
         if self.platform_choice in ("hermes", "both"):
-            self.install_hermes()
+            if self.hermes_deploy == "docker":
+                self.install_hermes_docker()
+            else:
+                self.install_hermes()
         if self.platform_choice in ("openclaw", "both"):
-            self.install_openclaw()
+            if self.openclaw_deploy == "docker":
+                self.install_openclaw_docker()
+            else:
+                self.install_openclaw()
         if self.platform_choice == "skip":
             self.log("Agent platform installation skipped", "WARNING")
 
@@ -805,22 +1206,39 @@ Tailscale-only access BEFORE any agent software installs.
             print(f"  {symbol}  {label}")
             return ok
 
-        check(f"Agent user '{self.agent_username}' exists", f"id {self.agent_username}")
-        check("Agent user has sudo", f"groups {self.agent_username} | grep -q sudo")
+        check(f"Your login '{self.agent_username}' exists", f"id {self.agent_username}")
+        check("Your login has sudo", f"groups {self.agent_username} | grep -q sudo")
         if self.ssh_keys_copied:
-            check("SSH key in place for agent user",
+            check("SSH key in place for your login",
                   f"test -s /home/{self.agent_username}/.ssh/authorized_keys")
         if self._step_done("docker_installed"):
             check("Docker service running", "systemctl is-active --quiet docker")
-            check("Docker usable by agent user", "docker ps", as_user=True)
+            check("Docker usable by your login", "docker ps", as_user=True)
         if self._step_done("tailscale_configured"):
             check("Tailscale connected", "tailscale ip -4")
         if self._step_done("codex_installed"):
-            check("Codex CLI on agent user PATH", "command -v codex", as_user=True)
+            check("Codex CLI on your PATH",
+                  "command -v codex || test -x ~/.npm-global/bin/codex", as_user=True)
         if self._step_done("claude_code_installed"):
-            check("Claude Code on agent user PATH", "command -v claude", as_user=True)
+            check("Claude Code on your PATH",
+                  "command -v claude || test -x ~/.local/bin/claude", as_user=True)
+        if self._step_done("hermes_installed"):
+            if self.hermes_deploy == "docker":
+                check("Hermes container running",
+                      "docker ps --filter name=clawrevops-hermes --filter status=running -q | grep -q .")
+            else:
+                check("Hermes Agent on your PATH", "command -v hermes", as_user=True)
         if self._step_done("openclaw_installed"):
-            check("OpenClaw on agent user PATH", "command -v openclaw", as_user=True)
+            if self.openclaw_deploy == "docker":
+                check("OpenClaw container running",
+                      "docker ps --filter name=clawrevops-openclaw --filter status=running -q | grep -q .")
+            else:
+                check("OpenClaw on your PATH", "command -v openclaw", as_user=True)
+        if self._step_done("desktop_setup"):
+            check("xrdp (Remote Desktop) service enabled",
+                  "systemctl is-enabled --quiet xrdp")
+        if self._step_done("chrome_installed"):
+            check("Google Chrome installed", "command -v google-chrome")
         check("Workspace folders exist",
               f"test -d /home/{self.agent_username}/clawrevops/agents")
 
@@ -836,45 +1254,89 @@ Tailscale-only access BEFORE any agent software installs.
 
     def create_final_report(self):
         user = self.agent_username
-        ts_line = (f"  Tailscale IP:   {self.tailscale_ip}"
-                   if self.tailscale_ip else "  Tailscale:      not configured")
+        ts_ip = self.tailscale_ip or "YOUR_TAILSCALE_IP"
 
-        report = f"""
+        print(f"""
 {Colors.BLUE}{Colors.BOLD}========================================
 ClawRevOps.ai setup is complete.
 Coded by Ty Shane using OpenAI.
 ========================================{Colors.ENDC}
 
 {Colors.BOLD}Your server:{Colors.ENDC}
-  Agent user:     {user}
-{ts_line}
+  Your username:  {user}
+  Tailscale IP:   {ts_ip}
   Workspace:      /home/{user}/clawrevops/
+""")
+        self.show_connection_info(heading="CONNECT FROM YOUR COMPUTER — SAVE THIS")
+        if self.server_mode == "full":
+            print(f"""{Colors.DIM}  Inside the Remote Desktop you have Chrome — do every tool login
+  there, point and click, no terminal tricks needed.{Colors.ENDC}
+""")
 
-{Colors.BOLD}Next steps — sign in to your tools (run these as '{user}', not root):{Colors.ENDC}
-"""
-        print(report)
+        print(f"{Colors.BOLD}Then start your tools (each one walks you through its own login):{Colors.ENDC}\n")
 
-        if self._step_done("claude_code_installed"):
+        # Driven by CHOICES, not just verified flags — the user always gets
+        # their launch commands even if a verification check was flaky.
+        plain_lines = []
+        if self.assistant_choice in ("codex", "both"):
+            if self.server_mode == "full":
+                print(f"""{Colors.CYAN}  Codex CLI:
+    In your Remote Desktop session, open a terminal and run:
+      codex
+    First run opens login — finish it in Chrome right there.{Colors.ENDC}
+""")
+            else:
+                print(f"""{Colors.CYAN}  Codex CLI:
+      codex
+    First run opens login. On a headless VPS the browser login needs
+    port forwarding — connect from your computer with:
+      ssh -L 1455:localhost:1455 {user}@{ts_ip}
+    then run 'codex' and open the link in your local browser.
+    (Alternative: sign in with an API key — see Codex docs){Colors.ENDC}
+""")
+            plain_lines.append(f"Codex:    run 'codex' as {user}")
+        if self.assistant_choice in ("claude", "both"):
             print(f"""{Colors.CYAN}  Claude Code:
-    1. ssh {user}@{self.tailscale_ip or 'YOUR_SERVER_IP'}
-    2. Run: claude
-    3. Follow the login link it prints (open it in any browser){Colors.ENDC}
+      claude
+    First run prints a login link — open it in any browser.{Colors.ENDC}
 """)
-        if self._step_done("codex_installed"):
-            print(f"""{Colors.CYAN}  Codex CLI:
-    1. Codex's browser login needs a localhost callback. From YOUR
-       computer, connect with port forwarding:
-         ssh -L 1455:localhost:1455 {user}@{self.tailscale_ip or 'YOUR_SERVER_IP'}
-    2. Run: codex login
-    3. Open the link it prints in your local browser
-       (Alternative: use an API key — see Codex docs){Colors.ENDC}
+            plain_lines.append(f"Claude Code:  run 'claude' as {user}")
+        if self.platform_choice in ("hermes", "both"):
+            if self.hermes_deploy == "docker":
+                print(f"""{Colors.CYAN}  Hermes Agent (Docker container 'clawrevops-hermes'):
+      docker exec -it clawrevops-hermes hermes setup
+    Walks you through provider, channels (Telegram etc.), and tools.
+    Once a channel is connected, you DM your agent from your phone.
+    Logs:    docker logs -f clawrevops-hermes
+    Manage:  your VPS panel's Docker Manager, or
+             cd ~/clawrevops/agents/hermes && docker compose ...{Colors.ENDC}
 """)
-        if self._step_done("openclaw_installed"):
-            print(f"""{Colors.CYAN}  OpenClaw:
-    1. ssh {user}@{self.tailscale_ip or 'YOUR_SERVER_IP'}
-    2. Run: openclaw onboard
-    3. Connect your provider and preferences{Colors.ENDC}
+                plain_lines.append("Hermes:   docker exec -it clawrevops-hermes hermes setup")
+            else:
+                print(f"""{Colors.CYAN}  Hermes Agent:
+      hermes setup
+    Walks you through provider, channels (Telegram etc.), and tools.
+    Then start it with:  hermes
+    Once a channel is connected, you DM your agent from your phone.
+    (Hermes has its own built-in browser for web automation.){Colors.ENDC}
 """)
+                plain_lines.append(f"Hermes:   run 'hermes setup' then 'hermes' as {user}")
+        if self.platform_choice in ("openclaw", "both"):
+            if self.openclaw_deploy == "docker":
+                print(f"""{Colors.CYAN}  OpenClaw (Docker container 'clawrevops-openclaw'):
+      docker exec -it clawrevops-openclaw node dist/index.js onboard
+    Connects your provider and preferences.
+    Logs:    docker logs -f clawrevops-openclaw
+    Manage:  your VPS panel's Docker Manager, or
+             cd ~/clawrevops/agents/openclaw && docker compose ...{Colors.ENDC}
+""")
+                plain_lines.append("OpenClaw: docker exec -it clawrevops-openclaw node dist/index.js onboard")
+            else:
+                print(f"""{Colors.CYAN}  OpenClaw:
+      openclaw onboard
+    Connects your provider and preferences.{Colors.ENDC}
+""")
+                plain_lines.append(f"OpenClaw: run 'openclaw onboard' as {user}")
 
         print(f"""{Colors.BOLD}Have you joined the AI community where we teach setups like this?{Colors.ENDC}
 
@@ -883,13 +1345,23 @@ Coded by Ty Shane using OpenAI.
 
         # Save a plain-text copy in the agent user's home
         try:
-            ansi = re.compile(r'\033\[[0-9;]*m')
             report_path = f"/home/{user}/clawrevops/SETUP_REPORT.txt"
-            plain = ansi.sub('', report)
             with open(report_path, "w") as f:
-                f.write(plain)
+                f.write("ClawRevOps.ai Agent VPS — Setup Report\n")
+                f.write("Coded by Ty Shane using OpenAI.\n\n")
+                f.write(f"Your username: {user}\n")
+                f.write(f"Tailscale IP: {ts_ip}\n")
+                f.write(f"SSH:          ssh {user}@{ts_ip}\n")
+                if self.server_mode == "full":
+                    f.write(f"Remote Desktop: connect to {ts_ip} (Windows: mstsc, "
+                            f"Mac: Windows App) as {user}\n")
+                f.write(f"Workspace:    /home/{user}/clawrevops/\n\n")
+                f.write("Launch commands:\n")
+                for line in plain_lines:
+                    f.write(f"  {line}\n")
                 f.write(f"\nCommunity: {COMMUNITY_URL}\n")
                 f.write(f"Setup log: {LOG_FILE}\n")
+                f.write("Re-run setup any time: sudo agent-setup\n")
             self.run_command(f"chown {user}:{user} {report_path}")
             self.log(f"Report saved to {report_path}", "SUCCESS")
         except Exception:
@@ -967,9 +1439,11 @@ Coded by Ty Shane using OpenAI.
         self.run_command("ufw allow in on tailscale0")
         self.run_command("ufw allow out on tailscale0")
 
-        # Allow SSH from both Tailscale IPv4 CGNAT and IPv6 ranges
+        # Allow SSH (and RDP in full mode) from Tailscale IPv4 CGNAT and IPv6 ranges
+        lockdown_ports = ["22"] + (["3389"] if self.server_mode == "full" else [])
         for subnet in ("100.64.0.0/10", "fd7a:115c:a1e0::/48"):
-            self.run_command(f"ufw allow from {subnet} to any port 22")
+            for port in lockdown_ports:
+                self.run_command(f"ufw allow from {subnet} to any port {port}")
         self.run_command("ufw --force enable")
 
         # Bind sshd to the Tailscale IP only
@@ -978,6 +1452,23 @@ Coded by Ty Shane using OpenAI.
         if f"ListenAddress {self.tailscale_ip}" not in sshd_config:
             with open("/etc/ssh/sshd_config", "a") as f:
                 f.write(f"\n# Tailscale only configuration\nListenAddress {self.tailscale_ip}\n")
+
+        # Reboot safety: if sshd starts before tailscale0 has its IP, the
+        # ListenAddress bind would fail and lock the user out after a reboot.
+        # 1) allow binding to a not-yet-present address
+        with open("/etc/sysctl.d/99-clawrevops-nonlocal-bind.conf", "w") as f:
+            f.write("# ClawRevOps: let sshd bind the Tailscale IP before it exists at boot\n"
+                    "net.ipv4.ip_nonlocal_bind=1\n"
+                    "net.ipv6.ip_nonlocal_bind=1\n")
+        self.run_command("sysctl --system", check=False)
+        # 2) start ssh after tailscaled so the interface is usually up first
+        dropin_dir = Path("/etc/systemd/system/ssh.service.d")
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        with open(dropin_dir / "10-clawrevops-after-tailscale.conf", "w") as f:
+            f.write("[Unit]\nAfter=tailscaled.service network-online.target\n"
+                    "Wants=tailscaled.service\n")
+        self.run_command("systemctl daemon-reload", check=False)
+
         self.service_command("restart", "ssh", "sshd")
 
         self.log("Server lockdown completed — SSH is now Tailscale-only", "SUCCESS")
@@ -1108,10 +1599,12 @@ Coded by Ty Shane using OpenAI.
             if self._step_done("server_locked_down"):
                 print(f"{Colors.GREEN}Phase 1 (security) already complete — "
                       f"continuing with agent stack installation.{Colors.ENDC}")
+                self.show_connection_info()
                 self.check_root()
                 self.install_docker()
                 self.install_coding_assistants()
                 self.install_agent_platforms()
+                self.install_chrome()
                 self.create_workspace()
                 self.verify_installation()
                 self.create_final_report()
@@ -1134,7 +1627,13 @@ Coded by Ty Shane using OpenAI.
             self.check_os()
             self.update_system()
             self.ensure_swap()
+            self.choose_coding_assistant()
+            self.choose_agent_platform()
+            self.choose_server_mode()
+            self.install_desktop()
             self.create_agent_user()
+            self.setup_user_session()
+            self.configure_rdp_persistence()
             self.install_tailscale()
 
             if not self.configure_tailscale():
@@ -1158,6 +1657,7 @@ Coded by Ty Shane using OpenAI.
             self.install_docker()
             self.install_coding_assistants()
             self.install_agent_platforms()
+            self.install_chrome()
             self.create_workspace()
             self.verify_installation()
             self.create_final_report()

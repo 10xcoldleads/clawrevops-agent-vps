@@ -168,11 +168,11 @@ main() {
 
     print_divider
     echo
-    echo -e "  Type ${YELLOW}${BOLD}INSTALL${RESET} to accept and continue, or anything else to cancel."
+    echo -e "  Type ${YELLOW}${BOLD}LETSGO${RESET} to accept and continue, or anything else to cancel."
     echo
     read -rp "  > " confirm
     echo
-    if [[ "$confirm" != "INSTALL" ]]; then
+    if [[ "$confirm" != "LETSGO" ]]; then
         echo -e "  ${YELLOW}Cancelled.${RESET} No changes were made to your server."
         echo
         exit 0
