@@ -250,6 +250,106 @@ Security is not optional here. Your agent server locks down to
 Tailscale-only access BEFORE any agent software installs.
 """)
 
+    def ensure_ssh_password_login(self):
+        """Make SSH password login WORK for the new user, then PROVE it.
+        Provider images (incl. Hostinger templates) often ship sshd drop-ins
+        that disable password auth or restrict users — which made the new
+        login fail with 'Permission denied' even with the right password.
+        ClawGlue never hit this because its login path was RDP (PAM), not
+        sshd. We enforce via a drop-in that wins first-match, then run a
+        REAL ssh login test with the actual password."""
+        print(f"\n{Colors.HEADER}=== ENABLING SSH LOGIN FOR '{self.agent_username}' ==={Colors.ENDC}")
+
+        user = self.agent_username
+        dropin = Path("/etc/ssh/sshd_config.d/05-clawrevops-login.conf")
+        dropin.parent.mkdir(parents=True, exist_ok=True)
+
+        lines = [
+            "# ClawRevOps: guarantee password + key login for your user.",
+            "# 05- sorts before provider/cloud-init drop-ins; first-match wins.",
+            "PasswordAuthentication yes",
+            "PubkeyAuthentication yes",
+            "KbdInteractiveAuthentication no",
+        ]
+
+        # If the provider config restricts logins to specific users, our user
+        # must be on that list. Read the EFFECTIVE config for this user.
+        eff = self.run_command(
+            f"sshd -T -C user={user},host=localhost,addr=127.0.0.1", check=False
+        )
+        if eff.returncode == 0:
+            for cfg_line in eff.stdout.splitlines():
+                if cfg_line.lower().startswith("allowusers"):
+                    allowed = cfg_line.split()[1:]
+                    if user not in allowed:
+                        lines.append("AllowUsers " + " ".join(allowed + [user]))
+                        self.log(f"Provider config restricts SSH users — added '{user}' "
+                                 f"to the allowed list", "WARNING")
+                if cfg_line.lower().startswith("denyusers") and user in cfg_line.split()[1:]:
+                    self.log(f"WARNING: provider config DENIES '{user}' — remove the "
+                             f"DenyUsers entry from /etc/ssh/sshd_config*", "ERROR")
+
+        dropin.write_text("\n".join(lines) + "\n")
+
+        # Make sure the main config actually includes the drop-in directory
+        with open("/etc/ssh/sshd_config") as f:
+            main_cfg = f.read()
+        if "sshd_config.d" not in main_cfg:
+            with open("/etc/ssh/sshd_config", "w") as f:
+                f.write("Include /etc/ssh/sshd_config.d/*.conf\n" + main_cfg)
+
+        result = self.run_command("sshd -t", check=False)
+        if result.returncode != 0:
+            dropin.unlink(missing_ok=True)
+            self.log("sshd validation failed — login drop-in rolled back, "
+                     "SSH unchanged", "ERROR")
+            return
+        self.service_command("restart", "ssh", "sshd")
+        self.log("Password SSH enabled for your login", "SUCCESS")
+
+        # PROVE it: real ssh login to localhost with the actual password.
+        password = getattr(self, "_login_password", None)
+        if not password:
+            return  # resume run — password not in memory; config is enforced above
+        self.run_command("DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass",
+                         check=False)
+        test_argv = [
+            "sshpass", "-p", password, "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+            f"{user}@127.0.0.1", "true",
+        ]
+        self.log("Testing your SSH login for real (username + password)...")
+        test = subprocess.run(test_argv, capture_output=True, text=True)
+        if test.returncode == 0:
+            self.log(f"VERIFIED: 'ssh {user}@<server>' works with your password", "SUCCESS")
+            self._save_state(ssh_login_verified=True)
+        else:
+            self.log("SSH login test FAILED — your password would not work from "
+                     "your computer. Diagnostics:", "ERROR")
+            diag = self.run_command(
+                f"sshd -T -C user={user},host=localhost,addr=127.0.0.1 | "
+                f"grep -Ei 'passwordauth|allowusers|denyusers|usepam|kbdinteractive'",
+                check=False
+            )
+            print(f"{Colors.WARNING}{diag.stdout}{Colors.ENDC}")
+            choice = self.get_user_input(
+                "How do you want to proceed?",
+                ["Retry the login test",
+                 "Continue anyway (NOT recommended — you may not be able to log in)"],
+                default_index=0
+            )
+            if choice == 0:
+                test = subprocess.run(test_argv, capture_output=True, text=True)
+                if test.returncode == 0:
+                    self.log("VERIFIED on retry: SSH login works", "SUCCESS")
+                    self._save_state(ssh_login_verified=True)
+                else:
+                    self.log("Still failing — continuing, but verify manually with "
+                             f"'ssh {user}@<server>' before lockdown!", "ERROR")
+
     # ── Step: server mode + desktop / RDP (ported from ClawGlue) ─────────────
 
     def choose_server_mode(self):
@@ -492,6 +592,9 @@ code=20
     def create_agent_user(self):
         if self._step_done("agent_user_created") and self.agent_username:
             self.log(f"Your login '{self.agent_username}' already created — skipping", "SUCCESS")
+            # Still enforce the SSH login config (covers servers created
+            # before this fix; live password test is skipped on resume)
+            self.ensure_ssh_password_login()
             return
 
         print(f"\n{Colors.HEADER}=== CREATE YOUR LOGIN ==={Colors.ENDC}")
@@ -610,10 +713,12 @@ code=20
         print()
 
         self.agent_username = username
+        self._login_password = password  # memory only — never written to state or logs
         self.log(f"Your login '{username}' is created (with sudo access)", "SUCCESS")
         self._save_state(agent_user_created=True, agent_username=username)
 
         self.copy_ssh_keys()
+        self.ensure_ssh_password_login()
 
     def copy_ssh_keys(self):
         """Copy root's authorized_keys to the new user so SSH key login works.

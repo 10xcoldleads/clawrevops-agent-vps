@@ -43,14 +43,14 @@ print_banner() {
     echo
     echo -e "  ${WHITE}This setup turns a fresh VPS into an AI agent server.${RESET}"
     echo
-    echo -e "  ${WHITE}It can install:${RESET}"
-    echo -e "  ${CYAN}  1)${RESET} A safe non-root user"
-    echo -e "  ${CYAN}  2)${RESET} Docker"
-    echo -e "  ${CYAN}  3)${RESET} Tailscale private networking"
-    echo -e "  ${CYAN}  4)${RESET} Claude Code or OpenAI Codex CLI"
-    echo -e "  ${CYAN}  5)${RESET} Hermes Agent or OpenClaw"
-    echo -e "  ${CYAN}  6)${RESET} Agent folders and workspace"
-    echo -e "  ${CYAN}  7)${RESET} Optional SSH hardening"
+    echo -e "  ${WHITE}It installs:${RESET}"
+    echo -e "  ${CYAN}  1)${RESET} Your own login (new username + password, never root)"
+    echo -e "  ${CYAN}  2)${RESET} Desktop + Remote Desktop (RDP) — full mode"
+    echo -e "  ${CYAN}  3)${RESET} Tailscale private networking + MANDATORY lockdown"
+    echo -e "  ${CYAN}  4)${RESET} Docker"
+    echo -e "  ${CYAN}  5)${RESET} Claude Code or OpenAI Codex CLI"
+    echo -e "  ${CYAN}  6)${RESET} Hermes Agent or OpenClaw (Docker or native)"
+    echo -e "  ${CYAN}  7)${RESET} Agent workspace + your connection info"
     echo
     echo -e "  ${YELLOW}${BOLD}  ⚠  WARNING${RESET}"
     echo -e "  ${YELLOW}  This script modifies users, system packages and (optionally) SSH${RESET}"
@@ -141,7 +141,7 @@ show_complete() {
     echo -e "  ${BOLD}What happens next:${RESET}"
     echo
     echo -e "  ${CYAN}  1.${RESET}  The setup wizard will guide you step by step"
-    echo -e "  ${CYAN}  2.${RESET}  You will create a safe non-root user for your agents"
+    echo -e "  ${CYAN}  2.${RESET}  You will create YOUR login (a new username + password)"
     echo -e "  ${CYAN}  3.${RESET}  You will pick your coding assistant and agent platform"
     echo -e "  ${CYAN}  4.${RESET}  You will be asked to authenticate Tailscale"
     echo -e "       ${DIM}(a link will appear — open it in your browser)${RESET}"
